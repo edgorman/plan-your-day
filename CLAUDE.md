@@ -41,6 +41,7 @@ The single non-negotiable constraint on this project: **it must cost ~$0/month a
 2. **Does this need a server at all?** Prefer static/client-side solutions (like the swipe-to-list sorting in Section 4) over adding backend endpoints.
 3. **Does this require a paid API key?** Avoid unless there's no free/open alternative (OSM over Mapbox, etc.).
 4. **Does this fit in Firestore?** Prefer modeling new data in Firestore over introducing a second datastore.
+5. **Where does this logic belong?** Business logic must never leak into `service/handlers` or `repository` code — both stay thin. Prefer a method on the relevant `entities` type over a freestanding `usecase`/util function; reach for a plain `usecase` function only when the logic doesn't belong to a single entity (e.g. it spans several, or needs a repository).
 
 ---
 
@@ -56,7 +57,10 @@ planyour.day/
 │                              # Terraform plan/apply workflows for infra/.
 ├── docs/                     # Human-facing documentation, not code:
 │   ├── architecture.md       #   - system diagram, data flow, scale-to-zero rationale
-│   └── api-spec.md           #   - REST endpoint contracts (request/response shapes)
+│   ├── api-spec.md           #   - REST endpoint contracts (request/response shapes)
+│   └── user-flow.md          #   - the intended end-to-end user flow (Section 4/5.3 detail
+│                              #     lives here in narrative form: onboarding → browse →
+│                              #     swipe → add a private event → sync → revisit/export)
 ├── infra/                    # Terraform for all GCP resources, one file per resource
 │   │                          # area rather than one monolithic file:
 │   ├── cloud_run.tf            #   - Cloud Run service (scale to zero)
@@ -137,8 +141,10 @@ services/backend/
     │                        # into business logic beyond struct tags).
     ├── usecase/              # Business logic: one package per bounded concern, operating
     │   ├── events/           #   on entity structs. Also owns private-event CRUD (Section
-    │   │                      #     5.3) — validation, ownership checks, and resolving a
-    │   │                      #     submitted address into a Location via GeocodeRepository.
+    │   │                      #     5.3) — validation, ownership checks, resolving a submitted
+    │   │                      #     address via GeocodeRepository, and ingestion: calling each
+    │   │                      #     EventSource and writing normalized results through
+    │   │                      #     EventRepository into the shared `events` collection.
     │   ├── pois/              #   - evergreen POI queries
     │   ├── users/              #   - user profile + preferences
     │   └── planner/            #   - tier enforcement (1-day vs multi-day), .ics export.
@@ -151,7 +157,11 @@ services/backend/
         │                     # `usecase/` depends on these interfaces, never on a
         │                     # concrete implementation directly.
         ├── user.go            #   - UserRepository interface
-        ├── event.go            #   - EventRepository interface
+        ├── event.go            #   - EventRepository interface: our own storage, read/write
+        │                       #     the shared `events` collection and private events
+        ├── eventsource.go       #   - EventSource interface: FetchEvents(ctx, ...) ([]entities.Event,
+        │                       #     error) — one implementation per external event listing site,
+        │                       #     all normalizing into the same Event type (see `http/` below)
         ├── poi.go              #   - POIRepository interface
         ├── geocoder.go          #   - GeocodeRepository interface (address string → Location)
         ├── firestore/           # Concrete implementation of the storage interfaces above —
@@ -160,9 +170,13 @@ services/backend/
         │   ├── event.go         #   backend is ever needed, it gets its own sibling
         │   └── poi.go           #   subpackage here (e.g. repository/memory/) implementing
         │                        #   the same interfaces from repository/.
-        └── nominatim/            # Concrete GeocodeRepository implementation against the
-            └── geocoder.go       #   Nominatim HTTP API (Section 1.2) — the only place that
-                                   #   makes an outbound call to OpenStreetMap's geocoder.
+        └── http/                 # Concrete implementations of every outbound HTTP integration —
+            ├── nominatim.go       #   named by transport, not by vendor, since it holds several
+            │                      #   unrelated providers: GeocodeRepository against Nominatim
+            │                      #   (Section 1.2)...
+            └── <source>.go         #   ...plus one EventSource implementation per external
+                                    #   event site/API (e.g. eventbrite.go, meetup.go — named
+                                    #   for whichever providers actually get integrated).
 ```
 
 **Dependency direction:** `service` (handlers) → `usecase` → `repository` → Firestore. `entities` has no outward dependencies and is imported by all layers. Never let `service/handlers` call `repository` directly, and never let `repository` contain business rules (e.g., tier limits belong in `usecase/planner`, not in a Firestore query file).
@@ -182,7 +196,7 @@ services/backend/
 - Auth: Firebase Auth ID tokens verified via middleware in `service/middleware.go`; unauthenticated routes are the exception, not the default.
 - Errors: a single consistent error envelope (`{"error": {"code": "...", "message": "..."}}`), mapped from typed errors defined in `usecase/`, not raw Firestore errors leaking to clients.
 - Versioning: prefix routes with `/api/v1` from day one to avoid a breaking migration later.
-- Address lookup: `GET /api/v1/geocode?address=...` proxies to Nominatim (`repository/nominatim`, see Section 3.2/1.2) and returns a `Location`, used by the "add a private event" flow to turn free-text input into coordinates before the event is saved.
+- Address lookup: `GET /api/v1/geocode?address=...` proxies to Nominatim (`repository/http/nominatim.go`, see Section 3.2/1.2) and returns a `Location`, used by the "add a private event" flow to turn free-text input into coordinates before the event is saved.
 
 ---
 
@@ -442,7 +456,7 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
 3. **Backend core**
    - Implement `entities/` structs from Section 5.
    - Implement `repository/` interfaces and their `repository/firestore/` implementations (events, POIs, users) against the local emulator.
-   - Implement `repository/nominatim` (`GeocodeRepository`) and the `/api/v1/geocode` proxy endpoint.
+   - Implement `repository/http/nominatim.go` (`GeocodeRepository`) and the `/api/v1/geocode` proxy endpoint. Add the first `EventSource` implementation under `repository/http/` once a real external event feed is chosen.
    - Implement `usecase/` layer with basic CRUD + date/geo filtering, including private-event CRUD scoped to `users/{uid}/privateEvents`.
    - Implement `service/handlers` + Firebase Auth middleware; wire `/api/v1/...` routes.
    - Seed script/fixtures for local dev sample events & POIs.
