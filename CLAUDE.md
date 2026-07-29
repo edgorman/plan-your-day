@@ -24,9 +24,9 @@ The single non-negotiable constraint on this project: **it must cost ~$0/month a
 
 - **Go (1.22+)** for the REST API: small static binaries, low memory footprint, fast startup — all of which directly minimize Cloud Run cold-start latency and per-request CPU billing.
 - **GCP Cloud Run**, configured to **scale to zero**. There is no traffic → no running container → no bill. Go's near-instant binary startup keeps cold starts around **~50ms**, so scale-to-zero doesn't translate into a bad user experience the way it would with a JVM or heavyweight Node server.
-- **Firestore (Native Mode)** as the only datastore. Firestore's free tier + pay-per-operation pricing means an idle database costs nothing, unlike a provisioned Cloud SQL instance that bills whether or not it's queried. Native Mode (not Datastore Mode) is required for real-time listeners and the richer query/index model, which the map + schedule views will eventually want.
+- **Firestore (Native Mode)** as the only datastore, accessed exclusively through the Go backend — **the frontend never talks to Firestore directly**, so there are no client-side Firestore security rules to maintain. Firestore's free tier + pay-per-operation pricing means an idle database costs nothing, unlike a provisioned Cloud SQL instance that bills whether or not it's queried. Native Mode (not Datastore Mode) is required for the richer query/index model the map + schedule views need.
 - No Redis, no message queue, no separate cache layer at this stage. If a caching need emerges (e.g., expensive geocoding lookups), prefer a Firestore-backed cache document/collection with a TTL field over standing up a new managed service — it avoids adding another always-billed component.
-- **Nominatim (OpenStreetMap) geocoding** for the private-event address lookup (Section 5.3) — same no-paid-key philosophy as the map tiles. Calls go through a backend proxy endpoint, never directly from the client, to respect Nominatim's usage policy (required `User-Agent`, rate limits); repeated lookups of the same address are a good candidate for the Firestore-backed TTL cache above.
+- **Geocoding for the private-event address lookup** (Section 5.3) — must be a free/open provider, no paid geocoding API key, same philosophy as the map tiles. Nominatim (OpenStreetMap) is the leading candidate but **has not been decided** — don't commit code or infra to it until it's confirmed. Whichever provider is chosen, calls go through a backend proxy endpoint, never directly from the client, to respect that provider's usage policy (User-Agent, rate limits); repeated lookups of the same address are a good candidate for the Firestore-backed TTL cache above.
 
 ### 1.3 Infra & CI/CD
 
@@ -133,30 +133,39 @@ services/backend/
     │   ├── middleware.go    #   - request logging, recover, CORS, auth (Firebase Auth
     │   │                    #     ID token verification lives here, not in a separate
     │   │                    #     platform package)
-    │   └── handlers/        #   - one file per resource: events.go, pois.go, users.go,
-    │                        #     preferences.go — thin: parse request → call usecase →
-    │                        #     write response. No Firestore calls in handlers.
+    │   └── handlers/        #   - one file per resource: events.go, pois.go, users.go —
+    │                        #     thin: parse request → call usecase → write response.
+    │                        #     No Firestore calls in handlers.
     ├── entities/            # Core types shared across layers (Go structs — see Section 5).
     │                        # No external deps in this package (no Firestore tags leak
     │                        # into business logic beyond struct tags).
     ├── usecase/              # Business logic: one package per bounded concern, operating
-    │   ├── events/           #   on entity structs. Also owns private-event CRUD (Section
-    │   │                      #     5.3) — validation, ownership checks, resolving a submitted
-    │   │                      #     address via GeocodeRepository, and ingestion: calling each
-    │   │                      #     EventSource and writing normalized results through
-    │   │                      #     EventRepository into the shared `events` collection.
+    │   ├── events/           #   on entity structs — public/shared Event queries (reads
+    │   │                      #     the `events` collection).
+    │   ├── privateevents/     #   - private-event CRUD (Section 5.3): validation, ownership
+    │   │                      #     checks, and resolving a submitted address to a Location
+    │   │                      #     via GeocodeRepository.
+    │   ├── discovery/         #   - the user searching for events externally: calls each
+    │   │                      #     EventSource live to populate a user's map/feed for a
+    │   │                      #     given date + location, normalizes results into Event,
+    │   │                      #     and upserts them into `events` via EventRepository as a
+    │   │                      #     cache for future requests.
     │   ├── pois/              #   - evergreen POI queries
-    │   ├── users/              #   - user profile + preferences
-    │   └── planner/            #   - tier enforcement (1-day vs multi-day), .ics export.
-    │                            #     Geo utilities (distance/bounding box) live in the
-    │                            #     usecase package that needs them, not a shared
-    │                            #     platform package.
+    │   ├── users/              #   - user profile, preferences, and wishlist (Section 5.6)
+    │   └── planner/            #   - tier enforcement (1-day vs multi-day), the day's plan
+    │                            #     CRUD (the swipe deck's current list — a per-date list
+    │                            #     of PlanItem, Section 5.4, since it holds both Events
+    │                            #     and EvergreenPOIs; not an EventList, which is Event-only
+    │                            #     — see Section 5.5), and .ics export. Geo utilities
+    │                            #     (distance/bounding box) live in the usecase package
+    │                            #     that needs them, not a shared platform package.
     └── repository/           # Storage & external API access — the only layer with
         │                     # outbound integrations. Each file at this level is an
         │                     # interface (e.g. `user.go` declares `UserRepository`);
         │                     # `usecase/` depends on these interfaces, never on a
         │                     # concrete implementation directly.
-        ├── user.go            #   - UserRepository interface
+        ├── user.go            #   - UserRepository interface (also owns the wishlist field,
+        │                       #     since it's an EventList embedded on the User document)
         ├── event.go            #   - EventRepository interface: our own storage, read/write
         │                       #     the shared `events` collection and private events
         ├── eventsource.go       #   - EventSource interface: FetchEvents(ctx, ...) ([]entities.Event,
@@ -171,12 +180,18 @@ services/backend/
         │   └── poi.go           #   subpackage here (e.g. repository/memory/) implementing
         │                        #   the same interfaces from repository/.
         └── http/                 # Concrete implementations of every outbound HTTP integration —
-            ├── nominatim.go       #   named by transport, not by vendor, since it holds several
-            │                      #   unrelated providers: GeocodeRepository against Nominatim
-            │                      #   (Section 1.2)...
-            └── <source>.go         #   ...plus one EventSource implementation per external
-                                    #   event site/API (e.g. eventbrite.go, meetup.go — named
-                                    #   for whichever providers actually get integrated).
+            │                      #   named by transport, not by vendor, since it holds several
+            │                      #   unrelated providers. Anywhere both this package and the
+            │                      #   standard library are imported together (e.g. the
+            │                      #   composition root), alias this one as `httprepository`
+            │                      #   to avoid shadowing `net/http`.
+            ├── geocoder.go         #   - GeocodeRepository implementation (provider not yet
+            │                       #     decided — Nominatim is the leading candidate, see
+            │                       #     Section 1.2; don't hardcode a vendor name here until
+            │                       #     it's confirmed)
+            └── <source>.go         #   - one EventSource implementation per external event
+                                    #     site/API (e.g. eventbrite.go, meetup.go — named for
+                                    #     whichever providers actually get integrated)
 ```
 
 **Dependency direction:** `service` (handlers) → `usecase` → `repository` → Firestore. `entities` has no outward dependencies and is imported by all layers. Never let `service/handlers` call `repository` directly, and never let `repository` contain business rules (e.g., tier limits belong in `usecase/planner`, not in a Firestore query file).
@@ -184,10 +199,11 @@ services/backend/
 ### 3.3 Firestore SDK integration
 
 - Use the official `cloud.google.com/go/firestore` client, instantiated once in `repository/firestore/firestore.go` and injected via the composition root in `cmd/api/main.go` (constructor injection, no globals/singletons).
-- Collections (initial): `events`, `pois`, `users`, `preferences` — exact schema in Section 5. Use Firestore document IDs that are meaningful where possible (e.g., user doc ID = Firebase Auth UID) to avoid an extra lookup index.
+- Collections (initial): `events`, `pois`, `users` — exact schema in Section 5. Use Firestore document IDs that are meaningful where possible (e.g., user doc ID = Firebase Auth UID) to avoid an extra lookup index. There is deliberately no separate `preferences` collection — `UserPreferences`-shaped fields live directly on the `users/{uid}` document (Section 5.6); don't reintroduce a second collection for them.
 - Private events (Section 5.3) live in a **user-scoped subcollection** — `users/{uid}/privateEvents/{eventId}` — not the shared `events` collection, since they're personal to that user and must never appear in another user's candidate pool. `EventRepository` takes a `uid` for private-event operations and routes to the right collection internally.
-- Reads that back the Map/Schedule views should be scoped by geohash + date range where feasible — plan for a `geohash` field on `events`/`pois` documents to support bounding-box queries without a paid geo-index service.
-- Cloud Run's service account (defined in `infra/iam.tf`) gets least-privilege IAM (`roles/datastore.user`) — never broader Firestore/Owner roles.
+- The day's plan (the swipe deck's **current list**, Section 4.1) is a per-date list of `PlanItem` (Section 5.4) — Events and EvergreenPOIs mixed — stored at `users/{uid}/plans/{date}`, one document per date; it is *not* an `EventList`, since it needs to hold POIs too. The user's **Wishlist** — a single global `EventList` (Section 5.5) the user can look back through for itineraries they aren't currently considering — is a `wishlist` field embedded directly on the `users/{uid}` document, read/written by `UserRepository`, not a separate collection.
+- Reads that back the Map/Schedule views should be scoped by geohash + date range where feasible — plan for a `geohash` field on `events`/`pois` documents as a basic proximity filter. A single geohash prefix only approximates a bounding box (false positives at cell edges); keep it simple for now and layer on a proper multi-range query technique later if it's actually needed — don't over-build this up front.
+- Cloud Run's service account (defined in `infra/iam.tf`) gets least-privilege IAM (`roles/datastore.user`) — never broader Firestore/Owner roles. Separately, Cloud Run's *invoker* policy needs to allow unauthenticated requests (`allUsers`), since auth is enforced by Firebase Auth in `service/middleware.go`, not by GCP IAM — `infra/iam.tf` should grant this explicitly rather than leaving it as a manual console step.
 - Local development talks to the Firestore emulator, run via `docker-compose.yml` and started as part of `make dev` (see Section 6) — never point local dev at production Firestore.
 
 ### 3.4 API conventions
@@ -196,7 +212,7 @@ services/backend/
 - Auth: Firebase Auth ID tokens verified via middleware in `service/middleware.go`; unauthenticated routes are the exception, not the default.
 - Errors: a single consistent error envelope (`{"error": {"code": "...", "message": "..."}}`), mapped from typed errors defined in `usecase/`, not raw Firestore errors leaking to clients.
 - Versioning: prefix routes with `/api/v1` from day one to avoid a breaking migration later.
-- Address lookup: `GET /api/v1/geocode?address=...` proxies to Nominatim (`repository/http/nominatim.go`, see Section 3.2/1.2) and returns a `Location`, used by the "add a private event" flow to turn free-text input into coordinates before the event is saved.
+- Address lookup: `GET /api/v1/geocode?address=...` proxies to whichever geocoding provider is chosen (`repository/http/geocoder.go`, see Section 3.2/1.2) and returns a `Location`, used by the "add a private event" flow to turn free-text input into coordinates before the event is saved. Full endpoint-by-endpoint design is deferred to `docs/api-spec.md` (Section 6, step 6) — this is just the one endpoint Section 4/5 already depend on by name.
 
 ---
 
@@ -209,16 +225,16 @@ The Schedule View's core promise is **zero API spam**: swiping through the card 
 1. On date selection, the frontend makes **one** request (`GET /api/v1/plan?date=...&lat=...&lng=...`) that returns the full candidate pool of events + POIs for that day within range.
 2. The pool is held in client state (React context or a small store, e.g. Zustand — evaluate at implementation time, but keep it dependency-light) and shown to the user one card at a time, in the order the backend returned it.
 3. Each swipe (`useSwipeDeck` hook, backed by `react-swipeable`) does one thing, purely client-side:
-   - **Right (save):** add the card to the **current list** — the list the user is actively building for the selected date. Create it on the first save if it doesn't exist yet.
-   - **Left (skip):** add the card to a single **generic catch-all list** shared across all skipped cards, then advance to the next card.
-4. Saved selections (both lists) are synced to the backend on a fixed 3-second interval whenever there are unsynced changes — never per-swipe, but frequent enough that a crashed tab or lost connection loses at most ~3 seconds of swipes. No explicit "sync" action for the user to remember to hit.
+   - **Right (save):** add the card to the **current list** — the list of `PlanItem` (Section 5.4) the user is actively building for the selected date, stored at `users/{uid}/plans/{date}`. Create it on the first save if it doesn't exist yet.
+   - **Left (skip):** add the card to the user's **Wishlist** — a single `EventList` embedded on their own record (Section 5.6), global across every date, not scoped to the one being browsed. It's a lookback list — itineraries or items the user isn't currently considering but might revisit later — not a per-day bucket.
+4. Saved selections (both the current list and the Wishlist) are synced to the backend on a fixed 3-second interval whenever there are unsynced changes — never per-swipe, but frequent enough that a crashed tab or lost connection loses at most ~3 seconds of swipes. No explicit "sync" action for the user to remember to hit.
 5. Private events (Section 5.3) don't go through the swipe deck at all — the user adds them directly via a form (title, time, address → geocoded to a `Location`), and they're inserted straight into the **current list** alongside anything swiped right.
 
 ### 4.2 Why this shape
 
 - Keeps Cloud Run request volume proportional to *sessions*, not *swipes* — directly protects the scale-to-zero cost model in Section 1.
 - Keeps the feed feeling instant (no network round-trip in the interaction loop), which matters for a swipe-gesture UI.
-- No weighting or ranking logic to build, test, or reason about — the deck order is exactly what the backend returned; a swipe only decides which of the two lists a card lands in.
+- No weighting or ranking logic to build, test, or reason about — the deck order is exactly what the backend returned; a swipe only decides whether a card lands in the current list or the Wishlist.
 
 ---
 
@@ -231,9 +247,10 @@ Keep Go structs (backend/Firestore) and TypeScript interfaces (frontend/API cont
 ```go
 // entities/location.go
 type Location struct {
-    Lat   float64 `json:"lat" firestore:"lat"`
-    Lng   float64 `json:"lng" firestore:"lng"`
-    Label string  `json:"label,omitempty" firestore:"label,omitempty"` // e.g. "Home", "Weekend trip"
+    Lat     float64 `json:"lat" firestore:"lat"`
+    Lng     float64 `json:"lng" firestore:"lng"`
+    Label   string  `json:"label,omitempty" firestore:"label,omitempty"` // e.g. "Home", "Weekend trip"
+    Address string  `json:"address,omitempty" firestore:"address,omitempty"` // raw string as typed/returned by geocoding — kept so a private event's address can be shown back in an edit form or re-geocoded later
 }
 ```
 
@@ -243,6 +260,7 @@ export interface Location {
   lat: number;
   lng: number;
   label?: string; // "Home", "Weekend trip"
+  address?: string; // raw geocoding input/output, for edit forms and re-geocoding
 }
 ```
 
@@ -313,7 +331,7 @@ export type Category =
 
 ### 5.3 Event (Transient)
 
-An `Event` is either sourced from a public feed (the shared candidate pool everyone swipes through) or added privately by a user — e.g. a relative's wedding — via a manual "add your own event" flow. Private events have no `SourceURL`, are never shown to other users, and get their `Location` from the address-lookup (geocoding) flow described in Section 1.2 / Section 3.2 rather than from an ingested feed. See Section 3.3 for where they're stored.
+An `Event` is either sourced from a public feed (the shared candidate pool everyone swipes through) or added privately by a user — e.g. a relative's wedding — via a manual "add your own event" flow. Private events have no `SourceURI`, are never shown to other users, and get their `Location` from the address-lookup (geocoding) flow described in Section 1.2 / Section 3.2 rather than from an ingested feed. See Section 3.3 for where they're stored.
 
 ```go
 // entities/event.go
@@ -329,7 +347,7 @@ type Event struct {
     EndTime     time.Time  `json:"endTime" firestore:"endTime"`
     IsTransient bool       `json:"isTransient" firestore:"isTransient"` // true, always, for Event
     IsPrivate   bool       `json:"isPrivate" firestore:"isPrivate"` // true for user-added personal events; excluded from the shared candidate pool
-    SourceURL   string     `json:"sourceUrl,omitempty" firestore:"sourceUrl,omitempty"` // always empty when IsPrivate
+    SourceURI   string     `json:"sourceUri,omitempty" firestore:"sourceUri,omitempty"` // where this Event came from; usually a web URL today but deliberately typed as a generic URI, not a URL, to leave room for other source types later. Always empty when IsPrivate.
     ImageURL    string     `json:"imageUrl,omitempty" firestore:"imageUrl,omitempty"`
 }
 ```
@@ -346,7 +364,7 @@ export interface Event {
   endTime: string;   // ISO 8601
   isTransient: true;
   isPrivate: boolean; // true for user-added personal events; excluded from the shared candidate pool
-  sourceUrl?: string; // always absent when isPrivate
+  sourceUri?: string; // always absent when isPrivate
   imageUrl?: string;
 }
 ```
@@ -383,18 +401,40 @@ export interface EvergreenPOI {
 export type PlanItem = Event | EvergreenPOI; // discriminated union on isTransient
 ```
 
-### 5.5 UserPreferences
+### 5.5 EventList
+
+A named, ordered collection of `Event`s — private events included. Deliberately Event-only, not `PlanItem`: the one place it's used today is the user's Wishlist (Section 5.6, Section 4.1), which doesn't need to hold POIs. The swipe deck's per-date **current list** is a different, looser shape (Section 5.4's `PlanItem`, since it does need to hold POIs) — don't conflate the two.
 
 ```go
-// entities/user_preferences.go
-type UserPreferences struct {
-    UserID           string     `json:"userId" firestore:"-"` // == Firebase Auth UID, doc ID
-    PrimaryLocation  Location   `json:"primaryLocation" firestore:"primaryLocation"`
+// entities/event_list.go
+type EventList struct {
+    ID     string  `json:"id" firestore:"-"` // Firestore doc ID
+    Events []Event `json:"events" firestore:"events"` // can include private events
+}
+```
+
+```ts
+export interface EventList {
+  id: string;
+  events: Event[];
+}
+```
+
+### 5.6 User
+
+`UserPreferences` is not a separate stored type — onboarding preferences live directly on the `User` document (`users/{uid}`), the same document private events and the Wishlist hang off of. There is intentionally no separate `preferences` collection.
+
+```go
+// entities/user.go
+type User struct {
+    ID                 string     `json:"id" firestore:"-"` // == Firebase Auth UID, doc ID
+    PrimaryLocation    Location   `json:"primaryLocation" firestore:"primaryLocation"`
     SecondaryLocations []Location `json:"secondaryLocations,omitempty" firestore:"secondaryLocations,omitempty"`
-    Interests        []Category `json:"interests" firestore:"interests"` // from onboarding
-    Tier             UserTier   `json:"tier" firestore:"tier"`
-    CreatedAt        time.Time  `json:"createdAt" firestore:"createdAt"`
-    UpdatedAt        time.Time  `json:"updatedAt" firestore:"updatedAt"`
+    Interests          []Category `json:"interests" firestore:"interests"` // from onboarding
+    Tier               UserTier   `json:"tier" firestore:"tier"`
+    Wishlist           EventList  `json:"wishlist" firestore:"wishlist"` // global catch-all, not scoped to any one date — see Section 4.1
+    CreatedAt          time.Time  `json:"createdAt" firestore:"createdAt"`
+    UpdatedAt          time.Time  `json:"updatedAt" firestore:"updatedAt"`
 }
 
 type UserTier string
@@ -408,22 +448,23 @@ const (
 ```ts
 export type UserTier = "free" | "paid";
 
-export interface UserPreferences {
-  userId: string;
+export interface User {
+  id: string;
   primaryLocation: Location;
   secondaryLocations?: Location[];
   interests: Category[];
   tier: UserTier;
+  wishlist: EventList;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
 }
 ```
 
-### 5.6 SwipeAction (client-side only — not persisted to Firestore by default, see Section 4.1)
+### 5.7 SwipeAction (client-side only — not persisted to Firestore by default, see Section 4.1)
 
 ```ts
 // types/swipe.ts — no Go struct: this never crosses the network in the default flow
-export type SwipeDirection = "left" | "right"; // left = skip → catch-all list, right = save → current list
+export type SwipeDirection = "left" | "right"; // left = skip → Wishlist, right = save → current list
 
 export interface SwipeAction {
   itemId: string;
@@ -455,9 +496,9 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
 
 3. **Backend core**
    - Implement `entities/` structs from Section 5.
-   - Implement `repository/` interfaces and their `repository/firestore/` implementations (events, POIs, users) against the local emulator.
-   - Implement `repository/http/nominatim.go` (`GeocodeRepository`) and the `/api/v1/geocode` proxy endpoint. Add the first `EventSource` implementation under `repository/http/` once a real external event feed is chosen.
-   - Implement `usecase/` layer with basic CRUD + date/geo filtering, including private-event CRUD scoped to `users/{uid}/privateEvents`.
+   - Implement `repository/` interfaces and their `repository/firestore/` implementations (events, POIs, users — including the wishlist field and the day's plan subcollection) against the local emulator.
+   - Implement `repository/http/geocoder.go` (`GeocodeRepository` — provider not yet decided) and the `/api/v1/geocode` proxy endpoint. Add the first `EventSource` implementation under `repository/http/` once a real external event source is chosen.
+   - Implement the `usecase/` layer: `events` (shared queries), `privateevents` (CRUD + geocoding), `discovery` (live `EventSource` search), `pois`, `users` (incl. wishlist), and `planner` (tier enforcement + the day's plan CRUD).
    - Implement `service/handlers` + Firebase Auth middleware; wire `/api/v1/...` routes.
    - Seed script/fixtures for local dev sample events & POIs.
 
@@ -465,7 +506,7 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
    - Onboarding flow: location input(s) + interest category picker (Section 2 of business rules).
    - API client (`lib/api.ts`) and TypeScript types from Section 5.
    - `MapView`: React-Leaflet + OSM tiles, 1-day time scrubber, pins for events/POIs with transient/evergreen badges.
-   - `ScheduleView`: swipeable card deck, `useSwipeDeck` hook (right → current list, left → catch-all list, per Section 4), transient/evergreen badges.
+   - `ScheduleView`: swipeable card deck, `useSwipeDeck` hook (right → current list, left → Wishlist, per Section 4), transient/evergreen badges.
    - "Add a private event" form: title, time, address (autocomplete against `/api/v1/geocode`) → inserted directly into the current list, badged distinctly from transient/evergreen items.
 
 5. **Tiering & monetization**
@@ -478,6 +519,6 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
    - Empty/error/loading states across both views.
    - Rate limiting / abuse protection on public endpoints.
    - Observability: structured logging (Cloud Logging via stdout JSON), basic uptime check in Terraform.
-   - `docs/architecture.md` and `docs/api-spec.md` written up to reflect what was actually built.
+   - `docs/architecture.md`, `docs/api-spec.md`, and `docs/user-flow.md` written up to reflect what was actually built.
 
 **When starting any session against this roadmap:** confirm which step you're on, re-read the relevant section of this file, and do not skip ahead to a later step's concerns (e.g., don't add Stripe billing logic while still on step 3).
