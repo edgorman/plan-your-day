@@ -2,7 +2,7 @@
 
 This file is the operating manual for Claude Code sessions working on **planyour.day**. Read it before making changes. It defines the architecture, the rules that keep the project cheap to run, the repository layout, the backend/frontend conventions, the core data models, and the roadmap for future sessions.
 
-> **App summary:** planyour.day is an AI-powered spatial-temporal social planner that helps users discover and organize activities based on location, interests, and time. Core interaction loop: pick a date → browse a map or a swipeable card feed of events/POIs (Points of Interest — evergreen places like restaurants, venues, and parks, as distinct from one-off transient events) → save what you like → export or revisit your plan.
+> **App summary:** planyour.day is an AI-powered spatial-temporal social planner that helps users discover and organize activities based on location, interests, and time. Core interaction loop: pick a date → browse a map or a swipeable card feed of events/POIs (Points of Interest — evergreen places like restaurants, venues, and parks, as distinct from one-off transient events) → save what you like → export or revisit your plan. Users can also manually add their own **private events** (e.g. a relative's wedding) into the same day's plan — see Section 5.3.
 
 ---
 
@@ -26,6 +26,7 @@ The single non-negotiable constraint on this project: **it must cost ~$0/month a
 - **GCP Cloud Run**, configured to **scale to zero**. There is no traffic → no running container → no bill. Go's near-instant binary startup keeps cold starts around **~50ms**, so scale-to-zero doesn't translate into a bad user experience the way it would with a JVM or heavyweight Node server.
 - **Firestore (Native Mode)** as the only datastore. Firestore's free tier + pay-per-operation pricing means an idle database costs nothing, unlike a provisioned Cloud SQL instance that bills whether or not it's queried. Native Mode (not Datastore Mode) is required for real-time listeners and the richer query/index model, which the map + schedule views will eventually want.
 - No Redis, no message queue, no separate cache layer at this stage. If a caching need emerges (e.g., expensive geocoding lookups), prefer a Firestore-backed cache document/collection with a TTL field over standing up a new managed service — it avoids adding another always-billed component.
+- **Nominatim (OpenStreetMap) geocoding** for the private-event address lookup (Section 5.3) — same no-paid-key philosophy as the map tiles. Calls go through a backend proxy endpoint, never directly from the client, to respect Nominatim's usage policy (required `User-Agent`, rate limits); repeated lookups of the same address are a good candidate for the Firestore-backed TTL cache above.
 
 ### 1.3 Infra & CI/CD
 
@@ -135,7 +136,9 @@ services/backend/
     │                        # No external deps in this package (no Firestore tags leak
     │                        # into business logic beyond struct tags).
     ├── usecase/              # Business logic: one package per bounded concern, operating
-    │   ├── events/           #   on entity structs.
+    │   ├── events/           #   on entity structs. Also owns private-event CRUD (Section
+    │   │                      #     5.3) — validation, ownership checks, and resolving a
+    │   │                      #     submitted address into a Location via GeocodeRepository.
     │   ├── pois/              #   - evergreen POI queries
     │   ├── users/              #   - user profile + preferences
     │   └── planner/            #   - tier enforcement (1-day vs multi-day), .ics export.
@@ -150,12 +153,16 @@ services/backend/
         ├── user.go            #   - UserRepository interface
         ├── event.go            #   - EventRepository interface
         ├── poi.go              #   - POIRepository interface
-        └── firestore/           # Concrete implementation of the above against Firestore —
-            ├── firestore.go     #   the ONLY subpackage that imports
-            ├── user.go          #   cloud.google.com/go/firestore. If a second storage
-            ├── event.go         #   backend is ever needed, it gets its own sibling
-            └── poi.go           #   subpackage here (e.g. repository/memory/) implementing
-                                  #   the same interfaces from repository/.
+        ├── geocoder.go          #   - GeocodeRepository interface (address string → Location)
+        ├── firestore/           # Concrete implementation of the storage interfaces above —
+        │   ├── firestore.go     #   the ONLY subpackage that imports
+        │   ├── user.go          #   cloud.google.com/go/firestore. If a second storage
+        │   ├── event.go         #   backend is ever needed, it gets its own sibling
+        │   └── poi.go           #   subpackage here (e.g. repository/memory/) implementing
+        │                        #   the same interfaces from repository/.
+        └── nominatim/            # Concrete GeocodeRepository implementation against the
+            └── geocoder.go       #   Nominatim HTTP API (Section 1.2) — the only place that
+                                   #   makes an outbound call to OpenStreetMap's geocoder.
 ```
 
 **Dependency direction:** `service` (handlers) → `usecase` → `repository` → Firestore. `entities` has no outward dependencies and is imported by all layers. Never let `service/handlers` call `repository` directly, and never let `repository` contain business rules (e.g., tier limits belong in `usecase/planner`, not in a Firestore query file).
@@ -164,6 +171,7 @@ services/backend/
 
 - Use the official `cloud.google.com/go/firestore` client, instantiated once in `repository/firestore/firestore.go` and injected via the composition root in `cmd/api/main.go` (constructor injection, no globals/singletons).
 - Collections (initial): `events`, `pois`, `users`, `preferences` — exact schema in Section 5. Use Firestore document IDs that are meaningful where possible (e.g., user doc ID = Firebase Auth UID) to avoid an extra lookup index.
+- Private events (Section 5.3) live in a **user-scoped subcollection** — `users/{uid}/privateEvents/{eventId}` — not the shared `events` collection, since they're personal to that user and must never appear in another user's candidate pool. `EventRepository` takes a `uid` for private-event operations and routes to the right collection internally.
 - Reads that back the Map/Schedule views should be scoped by geohash + date range where feasible — plan for a `geohash` field on `events`/`pois` documents to support bounding-box queries without a paid geo-index service.
 - Cloud Run's service account (defined in `infra/iam.tf`) gets least-privilege IAM (`roles/datastore.user`) — never broader Firestore/Owner roles.
 - Local development talks to the Firestore emulator, run via `docker-compose.yml` and started as part of `make dev` (see Section 6) — never point local dev at production Firestore.
@@ -174,6 +182,7 @@ services/backend/
 - Auth: Firebase Auth ID tokens verified via middleware in `service/middleware.go`; unauthenticated routes are the exception, not the default.
 - Errors: a single consistent error envelope (`{"error": {"code": "...", "message": "..."}}`), mapped from typed errors defined in `usecase/`, not raw Firestore errors leaking to clients.
 - Versioning: prefix routes with `/api/v1` from day one to avoid a breaking migration later.
+- Address lookup: `GET /api/v1/geocode?address=...` proxies to Nominatim (`repository/nominatim`, see Section 3.2/1.2) and returns a `Location`, used by the "add a private event" flow to turn free-text input into coordinates before the event is saved.
 
 ---
 
@@ -188,7 +197,8 @@ The Schedule View's core promise is **zero API spam**: swiping through the card 
 3. Each swipe (`useSwipeDeck` hook, backed by `react-swipeable`) does one thing, purely client-side:
    - **Right (save):** add the card to the **current list** — the list the user is actively building for the selected date. Create it on the first save if it doesn't exist yet.
    - **Left (skip):** add the card to a single **generic catch-all list** shared across all skipped cards, then advance to the next card.
-4. Saved selections (both lists) are only synced to the backend in a batched call (e.g., on view exit, on explicit "sync" action, or debounced) — never per-swipe.
+4. Saved selections (both lists) are synced to the backend on a fixed 3-second interval whenever there are unsynced changes — never per-swipe, but frequent enough that a crashed tab or lost connection loses at most ~3 seconds of swipes. No explicit "sync" action for the user to remember to hit.
+5. Private events (Section 5.3) don't go through the swipe deck at all — the user adds them directly via a form (title, time, address → geocoded to a `Location`), and they're inserted straight into the **current list** alongside anything swiped right.
 
 ### 4.2 Why this shape
 
@@ -224,44 +234,55 @@ export interface Location {
 
 ### 5.2 Category (shared enum)
 
-The top 20 categories a user is likely to search or filter across. There is deliberately no generic "other sports" catch-all — specific sports are broken out into their own categories instead, so search filters stay meaningful.
+The 25 most popular activities a user is likely to search for, ordered roughly by expected search frequency. Every value is a single word — no multi-word compounds (`gaming`, not `gaming_esports`) — and there is deliberately no generic "other sports" catch-all; specific sports are broken out into their own categories instead, so search filters stay meaningful.
 
 ```go
 type Category string
 
 const (
-    CategoryMusic              Category = "music"        // has Genre sub-tag
-    CategoryGamingEsports      Category = "gaming_esports"
-    CategoryAnime              Category = "anime"
-    CategoryBakingFood         Category = "baking_food"
-    CategoryCinema             Category = "cinema"
-    CategoryTheatrePerformingArts Category = "theatre_performing_arts"
-    CategoryComedy             Category = "comedy"
-    CategoryFootball           Category = "football"
-    CategoryBasketball         Category = "basketball"
-    CategoryTennis             Category = "tennis"
-    CategoryRunning            Category = "running"
-    CategoryCycling            Category = "cycling"
-    CategorySwimming           Category = "swimming"
-    CategoryGolf               Category = "golf"
-    CategoryFitnessWellness    Category = "fitness_wellness"
-    CategoryArtsOutdoors       Category = "arts_outdoors"
-    CategoryNightlife          Category = "nightlife"
-    CategoryMarketsShopping    Category = "markets_shopping"
-    CategoryFamilyKids         Category = "family_kids"
-    CategoryTechNetworking     Category = "tech_networking"
+    CategoryFood       Category = "food"
+    CategoryMusic      Category = "music"        // has Genre sub-tag
+    CategoryCinema     Category = "cinema"
+    CategoryShopping   Category = "shopping"
+    CategoryNightlife  Category = "nightlife"
+    CategoryFitness    Category = "fitness"
+    CategoryFamily     Category = "family"
+    CategoryOutdoors   Category = "outdoors"
+    CategoryComedy     Category = "comedy"
+    CategoryTheatre    Category = "theatre"
+    CategoryGaming     Category = "gaming"
+    CategoryArts       Category = "arts"
+    CategoryMarkets    Category = "markets"
+    CategoryFootball   Category = "football"
+    CategoryBasketball Category = "basketball"
+    CategoryTennis     Category = "tennis"
+    CategoryRunning    Category = "running"
+    CategoryCycling    Category = "cycling"
+    CategorySwimming   Category = "swimming"
+    CategoryGolf       Category = "golf"
+    CategoryAnime      Category = "anime"
+    CategoryWellness   Category = "wellness"
+    CategoryNetworking Category = "networking"
+    CategoryKids       Category = "kids"
+    CategoryEsports    Category = "esports"
 )
 ```
 
 ```ts
 export type Category =
+  | "food"
   | "music"
-  | "gaming_esports"
-  | "anime"
-  | "baking_food"
   | "cinema"
-  | "theatre_performing_arts"
+  | "shopping"
+  | "nightlife"
+  | "fitness"
+  | "family"
+  | "outdoors"
   | "comedy"
+  | "theatre"
+  | "gaming"
+  | "arts"
+  | "markets"
   | "football"
   | "basketball"
   | "tennis"
@@ -269,15 +290,16 @@ export type Category =
   | "cycling"
   | "swimming"
   | "golf"
-  | "fitness_wellness"
-  | "arts_outdoors"
-  | "nightlife"
-  | "markets_shopping"
-  | "family_kids"
-  | "tech_networking";
+  | "anime"
+  | "wellness"
+  | "networking"
+  | "kids"
+  | "esports";
 ```
 
 ### 5.3 Event (Transient)
+
+An `Event` is either sourced from a public feed (the shared candidate pool everyone swipes through) or added privately by a user — e.g. a relative's wedding — via a manual "add your own event" flow. Private events have no `SourceURL`, are never shown to other users, and get their `Location` from the address-lookup (geocoding) flow described in Section 1.2 / Section 3.2 rather than from an ingested feed. See Section 3.3 for where they're stored.
 
 ```go
 // entities/event.go
@@ -292,7 +314,8 @@ type Event struct {
     StartTime   time.Time  `json:"startTime" firestore:"startTime"`
     EndTime     time.Time  `json:"endTime" firestore:"endTime"`
     IsTransient bool       `json:"isTransient" firestore:"isTransient"` // true, always, for Event
-    SourceURL   string     `json:"sourceUrl,omitempty" firestore:"sourceUrl,omitempty"`
+    IsPrivate   bool       `json:"isPrivate" firestore:"isPrivate"` // true for user-added personal events; excluded from the shared candidate pool
+    SourceURL   string     `json:"sourceUrl,omitempty" firestore:"sourceUrl,omitempty"` // always empty when IsPrivate
     ImageURL    string     `json:"imageUrl,omitempty" firestore:"imageUrl,omitempty"`
 }
 ```
@@ -308,7 +331,8 @@ export interface Event {
   startTime: string; // ISO 8601
   endTime: string;   // ISO 8601
   isTransient: true;
-  sourceUrl?: string;
+  isPrivate: boolean; // true for user-added personal events; excluded from the shared candidate pool
+  sourceUrl?: string; // always absent when isPrivate
   imageUrl?: string;
 }
 ```
@@ -418,7 +442,8 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
 3. **Backend core**
    - Implement `entities/` structs from Section 5.
    - Implement `repository/` interfaces and their `repository/firestore/` implementations (events, POIs, users) against the local emulator.
-   - Implement `usecase/` layer with basic CRUD + date/geo filtering.
+   - Implement `repository/nominatim` (`GeocodeRepository`) and the `/api/v1/geocode` proxy endpoint.
+   - Implement `usecase/` layer with basic CRUD + date/geo filtering, including private-event CRUD scoped to `users/{uid}/privateEvents`.
    - Implement `service/handlers` + Firebase Auth middleware; wire `/api/v1/...` routes.
    - Seed script/fixtures for local dev sample events & POIs.
 
@@ -427,6 +452,7 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
    - API client (`lib/api.ts`) and TypeScript types from Section 5.
    - `MapView`: React-Leaflet + OSM tiles, 1-day time scrubber, pins for events/POIs with transient/evergreen badges.
    - `ScheduleView`: swipeable card deck, `useSwipeDeck` hook (right → current list, left → catch-all list, per Section 4), transient/evergreen badges.
+   - "Add a private event" form: title, time, address (autocomplete against `/api/v1/geocode`) → inserted directly into the current list, badged distinctly from transient/evergreen items.
 
 5. **Tiering & monetization**
    - `usecase/planner` tier enforcement: free tier hard-limited to 1-day queries.
