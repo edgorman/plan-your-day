@@ -133,15 +133,16 @@ services/backend/
     │   ├── middleware.go    #   - request logging, recover, CORS, auth (Firebase Auth
     │   │                    #     ID token verification lives here, not in a separate
     │   │                    #     platform package)
-    │   └── handlers/        #   - one file per resource: events.go, pois.go, users.go —
-    │                        #     thin: parse request → call usecase → write response.
-    │                        #     No Firestore calls in handlers.
+    │   └── handlers/        #   - one file per resource: events.go, users.go — thin: parse
+    │                        #     request → call usecase → write response. No Firestore
+    │                        #     calls in handlers.
     ├── entities/            # Core types shared across layers (Go structs — see Section 5).
     │                        # No external deps in this package (no Firestore tags leak
     │                        # into business logic beyond struct tags).
     ├── usecase/              # Business logic: one package per bounded concern, operating
     │   ├── events/           #   on entity structs — public/shared Event queries (reads
-    │   │                      #     the `events` collection).
+    │   │                      #     the `events` collection; covers both transient events
+    │   │                      #     and evergreen POIs, distinguished by IsTransient).
     │   ├── privateevents/     #   - private-event CRUD (Section 5.3): validation, ownership
     │   │                      #     checks, and resolving a submitted address to a Location
     │   │                      #     via GeocodeRepository.
@@ -150,13 +151,10 @@ services/backend/
     │   │                      #     given date + location, normalizes results into Event,
     │   │                      #     and upserts them into `events` via EventRepository as a
     │   │                      #     cache for future requests.
-    │   ├── pois/              #   - evergreen POI queries
-    │   ├── users/              #   - user profile, preferences, and wishlist (Section 5.6)
+    │   ├── users/              #   - user profile, preferences, and wishlist (Section 5.5)
     │   └── planner/            #   - tier enforcement (1-day vs multi-day), the day's plan
-    │                            #     CRUD (the swipe deck's current list — a per-date list
-    │                            #     of PlanItem, Section 5.4, since it holds both Events
-    │                            #     and EvergreenPOIs; not an EventList, which is Event-only
-    │                            #     — see Section 5.5), and .ics export. Geo utilities
+    │                            #     CRUD (the swipe deck's current list — an EventList per
+    │                            #     date, Section 3.3/5.4), and .ics export. Geo utilities
     │                            #     (distance/bounding box) live in the usecase package
     │                            #     that needs them, not a shared platform package.
     └── repository/           # Storage & external API access — the only layer with
@@ -167,17 +165,18 @@ services/backend/
         ├── user.go            #   - UserRepository interface (also owns the wishlist field,
         │                       #     since it's an EventList embedded on the User document)
         ├── event.go            #   - EventRepository interface: our own storage, read/write
-        │                       #     the shared `events` collection and private events
+        │                       #     the shared `events` collection and private events —
+        │                       #     one collection, one interface, for both transient
+        │                       #     events and evergreen POIs
         ├── eventsource.go       #   - EventSource interface: FetchEvents(ctx, ...) ([]entities.Event,
         │                       #     error) — one implementation per external event listing site,
         │                       #     all normalizing into the same Event type (see `http/` below)
-        ├── poi.go              #   - POIRepository interface
         ├── geocoder.go          #   - GeocodeRepository interface (address string → Location)
         ├── firestore/           # Concrete implementation of the storage interfaces above —
         │   ├── firestore.go     #   the ONLY subpackage that imports
         │   ├── user.go          #   cloud.google.com/go/firestore. If a second storage
-        │   ├── event.go         #   backend is ever needed, it gets its own sibling
-        │   └── poi.go           #   subpackage here (e.g. repository/memory/) implementing
+        │   └── event.go         #   backend is ever needed, it gets its own sibling
+        │                        #   subpackage here (e.g. repository/memory/) implementing
         │                        #   the same interfaces from repository/.
         └── http/                 # Concrete implementations of every outbound HTTP integration —
             │                      #   named by transport, not by vendor, since it holds several
@@ -199,10 +198,10 @@ services/backend/
 ### 3.3 Firestore SDK integration
 
 - Use the official `cloud.google.com/go/firestore` client, instantiated once in `repository/firestore/firestore.go` and injected via the composition root in `cmd/api/main.go` (constructor injection, no globals/singletons).
-- Collections (initial): `events`, `pois`, `users` — exact schema in Section 5. Use Firestore document IDs that are meaningful where possible (e.g., user doc ID = Firebase Auth UID) to avoid an extra lookup index. There is deliberately no separate `preferences` collection — `UserPreferences`-shaped fields live directly on the `users/{uid}` document (Section 5.6); don't reintroduce a second collection for them.
+- Collections (initial): `events`, `users` — exact schema in Section 5. Use Firestore document IDs that are meaningful where possible (e.g., user doc ID = Firebase Auth UID) to avoid an extra lookup index. There is deliberately no separate `preferences` collection — `UserPreferences`-shaped fields live directly on the `users/{uid}` document (Section 5.5); don't reintroduce a second collection for them. There is also deliberately no separate `pois` collection — evergreen POIs are just `Event` documents with `IsTransient: false`.
 - Private events (Section 5.3) live in a **user-scoped subcollection** — `users/{uid}/privateEvents/{eventId}` — not the shared `events` collection, since they're personal to that user and must never appear in another user's candidate pool. `EventRepository` takes a `uid` for private-event operations and routes to the right collection internally.
-- The day's plan (the swipe deck's **current list**, Section 4.1) is a per-date list of `PlanItem` (Section 5.4) — Events and EvergreenPOIs mixed — stored at `users/{uid}/plans/{date}`, one document per date; it is *not* an `EventList`, since it needs to hold POIs too. The user's **Wishlist** — a single global `EventList` (Section 5.5) the user can look back through for itineraries they aren't currently considering — is a `wishlist` field embedded directly on the `users/{uid}` document, read/written by `UserRepository`, not a separate collection.
-- Reads that back the Map/Schedule views should be scoped by geohash + date range where feasible — plan for a `geohash` field on `events`/`pois` documents as a basic proximity filter. A single geohash prefix only approximates a bounding box (false positives at cell edges); keep it simple for now and layer on a proper multi-range query technique later if it's actually needed — don't over-build this up front.
+- The day's plan (the swipe deck's **current list**, Section 4.1) is a per-date `EventList` (Section 5.4) stored at `users/{uid}/plans/{date}`, one document per date. The user's **Wishlist** — a single global `EventList` the user can look back through for itineraries they aren't currently considering — is a `wishlist` field embedded directly on the `users/{uid}` document, read/written by `UserRepository`, not a separate collection.
+- Reads that back the Map/Schedule views should be scoped by geohash + date range where feasible — plan for a `geohash` field on `events` documents as a basic proximity filter. A single geohash prefix only approximates a bounding box (false positives at cell edges); keep it simple for now and layer on a proper multi-range query technique later if it's actually needed — don't over-build this up front.
 - Cloud Run's service account (defined in `infra/iam.tf`) gets least-privilege IAM (`roles/datastore.user`) — never broader Firestore/Owner roles. Separately, Cloud Run's *invoker* policy needs to allow unauthenticated requests (`allUsers`), since auth is enforced by Firebase Auth in `service/middleware.go`, not by GCP IAM — `infra/iam.tf` should grant this explicitly rather than leaving it as a manual console step.
 - Local development talks to the Firestore emulator, run via `docker-compose.yml` and started as part of `make dev` (see Section 6) — never point local dev at production Firestore.
 
@@ -222,11 +221,11 @@ The Schedule View's core promise is **zero API spam**: swiping through the card 
 
 ### 4.1 Data flow
 
-1. On date selection, the frontend makes **one** request (`GET /api/v1/plan?date=...&lat=...&lng=...`) that returns the full candidate pool of events + POIs for that day within range.
+1. On date selection, the frontend makes **one** request (`GET /api/v1/plan?date=...&lat=...&lng=...`) that returns the full candidate pool of Events (transient and evergreen — Section 5.3) for that day within range.
 2. The pool is held in client state (React context or a small store, e.g. Zustand — evaluate at implementation time, but keep it dependency-light) and shown to the user one card at a time, in the order the backend returned it.
 3. Each swipe (`useSwipeDeck` hook, backed by `react-swipeable`) does one thing, purely client-side:
-   - **Right (save):** add the card to the **current list** — the list of `PlanItem` (Section 5.4) the user is actively building for the selected date, stored at `users/{uid}/plans/{date}`. Create it on the first save if it doesn't exist yet.
-   - **Left (skip):** add the card to the user's **Wishlist** — a single `EventList` embedded on their own record (Section 5.6), global across every date, not scoped to the one being browsed. It's a lookback list — itineraries or items the user isn't currently considering but might revisit later — not a per-day bucket.
+   - **Right (save):** add the card to the **current list** — an `EventList` (Section 5.4) the user is actively building for the selected date, stored at `users/{uid}/plans/{date}`. Create it on the first save if it doesn't exist yet.
+   - **Left (skip):** add the card to the user's **Wishlist** — a single `EventList` embedded on their own record (Section 5.5), global across every date, not scoped to the one being browsed. It's a lookback list — itineraries or items the user isn't currently considering but might revisit later — not a per-day bucket.
 4. Saved selections (both the current list and the Wishlist) are synced to the backend on a fixed 3-second interval whenever there are unsynced changes — never per-swipe, but frequent enough that a crashed tab or lost connection loses at most ~3 seconds of swipes. No explicit "sync" action for the user to remember to hit.
 5. Private events (Section 5.3) don't go through the swipe deck at all — the user adds them directly via a form (title, time, address → geocoded to a `Location`), and they're inserted straight into the **current list** alongside anything swiped right.
 
@@ -329,26 +328,29 @@ export type Category =
   | "esports";
 ```
 
-### 5.3 Event (Transient)
+### 5.3 Event
+
+A single entity for both **transient events** (concerts, matches, pop-ups — have a start/end time) and **evergreen POIs** (restaurants, venues, parks — have opening hours instead), distinguished by `IsTransient`. They're the same underlying thing — a place or happening with a category and a location — so one entity with an optional time-shaped field and an optional hours-shaped field is simpler than two near-identical structs plus a union type to paper over the difference. UI badging (Section 4) still visually distinguishes the two; only the data model is unified.
 
 An `Event` is either sourced from a public feed (the shared candidate pool everyone swipes through) or added privately by a user — e.g. a relative's wedding — via a manual "add your own event" flow. Private events have no `SourceURI`, are never shown to other users, and get their `Location` from the address-lookup (geocoding) flow described in Section 1.2 / Section 3.2 rather than from an ingested feed. See Section 3.3 for where they're stored.
 
 ```go
 // entities/event.go
 type Event struct {
-    ID          string     `json:"id" firestore:"-"` // Firestore doc ID
-    Title       string     `json:"title" firestore:"title"`
-    Description string     `json:"description,omitempty" firestore:"description,omitempty"`
-    Category    Category   `json:"category" firestore:"category"`
-    Genre       string     `json:"genre,omitempty" firestore:"genre,omitempty"` // for music
-    Location    Location   `json:"location" firestore:"location"`
-    Geohash     string     `json:"-" firestore:"geohash"` // query support, not exposed to client
-    StartTime   time.Time  `json:"startTime" firestore:"startTime"`
-    EndTime     time.Time  `json:"endTime" firestore:"endTime"`
-    IsTransient bool       `json:"isTransient" firestore:"isTransient"` // true, always, for Event
-    IsPrivate   bool       `json:"isPrivate" firestore:"isPrivate"` // true for user-added personal events; excluded from the shared candidate pool
-    SourceURI   string     `json:"sourceUri,omitempty" firestore:"sourceUri,omitempty"` // where this Event came from; usually a web URL today but deliberately typed as a generic URI, not a URL, to leave room for other source types later. Always empty when IsPrivate.
-    ImageURL    string     `json:"imageUrl,omitempty" firestore:"imageUrl,omitempty"`
+    ID           string            `json:"id" firestore:"-"` // Firestore doc ID
+    Title        string            `json:"title" firestore:"title"`
+    Description  string            `json:"description,omitempty" firestore:"description,omitempty"`
+    Category     Category          `json:"category" firestore:"category"`
+    Genre        string            `json:"genre,omitempty" firestore:"genre,omitempty"` // for music
+    Location     Location          `json:"location" firestore:"location"`
+    Geohash      string            `json:"-" firestore:"geohash"` // query support, not exposed to client
+    IsTransient  bool              `json:"isTransient" firestore:"isTransient"` // true = one-off, has Start/EndTime; false = evergreen, has OpeningHours
+    StartTime    time.Time         `json:"startTime,omitempty" firestore:"startTime,omitempty"` // set when IsTransient
+    EndTime      time.Time         `json:"endTime,omitempty" firestore:"endTime,omitempty"`     // set when IsTransient
+    OpeningHours map[string]string `json:"openingHours,omitempty" firestore:"openingHours,omitempty"` // "mon": "09:00-18:00" — set when !IsTransient
+    IsPrivate    bool              `json:"isPrivate" firestore:"isPrivate"` // true for user-added personal events; excluded from the shared candidate pool
+    SourceURI    string            `json:"sourceUri,omitempty" firestore:"sourceUri,omitempty"` // where this Event came from; usually a web URL today but deliberately typed as a generic URI, not a URL, to leave room for other source types later. Always empty when IsPrivate.
+    ImageURL     string            `json:"imageUrl,omitempty" firestore:"imageUrl,omitempty"`
 }
 ```
 
@@ -360,50 +362,19 @@ export interface Event {
   category: Category;
   genre?: string;
   location: Location;
-  startTime: string; // ISO 8601
-  endTime: string;   // ISO 8601
-  isTransient: true;
+  isTransient: boolean; // true = one-off, has startTime/endTime; false = evergreen, has openingHours
+  startTime?: string; // ISO 8601, set when isTransient
+  endTime?: string;   // ISO 8601, set when isTransient
+  openingHours?: Record<string, string>; // { mon: "09:00-18:00" }, set when !isTransient
   isPrivate: boolean; // true for user-added personal events; excluded from the shared candidate pool
   sourceUri?: string; // always absent when isPrivate
   imageUrl?: string;
 }
 ```
 
-### 5.4 EvergreenPOI
+### 5.4 EventList
 
-```go
-// entities/poi.go
-type EvergreenPOI struct {
-    ID          string   `json:"id" firestore:"-"`
-    Name        string   `json:"name" firestore:"name"`
-    Description string   `json:"description,omitempty" firestore:"description,omitempty"`
-    Category    Category `json:"category" firestore:"category"`
-    Location    Location `json:"location" firestore:"location"`
-    Geohash     string   `json:"-" firestore:"geohash"`
-    OpeningHours map[string]string `json:"openingHours,omitempty" firestore:"openingHours,omitempty"` // "mon": "09:00-18:00"
-    IsTransient bool     `json:"isTransient" firestore:"isTransient"` // false, always, for POI
-    ImageURL    string   `json:"imageUrl,omitempty" firestore:"imageUrl,omitempty"`
-}
-```
-
-```ts
-export interface EvergreenPOI {
-  id: string;
-  name: string;
-  description?: string;
-  category: Category;
-  location: Location;
-  openingHours?: Record<string, string>; // { mon: "09:00-18:00" }
-  isTransient: false;
-  imageUrl?: string;
-}
-
-export type PlanItem = Event | EvergreenPOI; // discriminated union on isTransient
-```
-
-### 5.5 EventList
-
-A named, ordered collection of `Event`s — private events included. Deliberately Event-only, not `PlanItem`: the one place it's used today is the user's Wishlist (Section 5.6, Section 4.1), which doesn't need to hold POIs. The swipe deck's per-date **current list** is a different, looser shape (Section 5.4's `PlanItem`, since it does need to hold POIs) — don't conflate the two.
+A named, ordered collection of `Event`s — private events included. It's the one list shape in this doc: the swipe deck's per-date **current list** (`users/{uid}/plans/{date}`) and the user's global **Wishlist** (Section 5.5, Section 4.1) are both plain `EventList`s, distinguished only by where they're stored.
 
 ```go
 // entities/event_list.go
@@ -420,7 +391,7 @@ export interface EventList {
 }
 ```
 
-### 5.6 User
+### 5.5 User
 
 `UserPreferences` is not a separate stored type — onboarding preferences live directly on the `User` document (`users/{uid}`), the same document private events and the Wishlist hang off of. There is intentionally no separate `preferences` collection.
 
@@ -460,7 +431,7 @@ export interface User {
 }
 ```
 
-### 5.7 SwipeAction (client-side only — not persisted to Firestore by default, see Section 4.1)
+### 5.6 SwipeAction (client-side only — not persisted to Firestore by default, see Section 4.1)
 
 ```ts
 // types/swipe.ts — no Go struct: this never crosses the network in the default flow
@@ -468,7 +439,6 @@ export type SwipeDirection = "left" | "right"; // left = skip → Wishlist, righ
 
 export interface SwipeAction {
   itemId: string;
-  itemType: "event" | "poi";
   direction: SwipeDirection;
   timestamp: string; // ISO 8601, local
 }
@@ -496,9 +466,9 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
 
 3. **Backend core**
    - Implement `entities/` structs from Section 5.
-   - Implement `repository/` interfaces and their `repository/firestore/` implementations (events, POIs, users — including the wishlist field and the day's plan subcollection) against the local emulator.
+   - Implement `repository/` interfaces and their `repository/firestore/` implementations (events, users — including the wishlist field and the day's plan subcollection) against the local emulator.
    - Implement `repository/http/geocoder.go` (`GeocodeRepository` — provider not yet decided) and the `/api/v1/geocode` proxy endpoint. Add the first `EventSource` implementation under `repository/http/` once a real external event source is chosen.
-   - Implement the `usecase/` layer: `events` (shared queries), `privateevents` (CRUD + geocoding), `discovery` (live `EventSource` search), `pois`, `users` (incl. wishlist), and `planner` (tier enforcement + the day's plan CRUD).
+   - Implement the `usecase/` layer: `events` (shared queries, covering both transient events and evergreen POIs), `privateevents` (CRUD + geocoding), `discovery` (live `EventSource` search), `users` (incl. wishlist), and `planner` (tier enforcement + the day's plan CRUD).
    - Implement `service/handlers` + Firebase Auth middleware; wire `/api/v1/...` routes.
    - Seed script/fixtures for local dev sample events & POIs.
 
@@ -512,7 +482,7 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
 5. **Tiering & monetization**
    - `usecase/planner` tier enforcement: free tier hard-limited to 1-day queries.
    - Paid tier: multi-day/90-day/1-year planning endpoints.
-   - `.ics` export (likely client-side generation from saved `PlanItem[]`, no backend needed — evaluate against cost rules in Section 1).
+   - `.ics` export (likely client-side generation from the current list's `Event[]`, no backend needed — evaluate against cost rules in Section 1).
    - Stripe (or chosen provider) integration for tier upgrades — design as its own future session, not bundled into this step.
 
 6. **Polish & hardening**
