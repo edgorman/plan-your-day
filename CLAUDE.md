@@ -37,7 +37,7 @@ The single non-negotiable constraint on this project: **it must cost ~$0/month a
 ### 1.4 Rules of thumb for future changes
 
 1. **Would this component bill while idle?** If yes, justify it explicitly or find a scale-to-zero alternative.
-2. **Does this need a server at all?** Prefer static/client-side solutions (like the swipe re-ranking in Section 4) over adding backend endpoints.
+2. **Does this need a server at all?** Prefer static/client-side solutions (like the swipe-to-list sorting in Section 4) over adding backend endpoints.
 3. **Does this require a paid API key?** Avoid unless there's no free/open alternative (OSM over Mapbox, etc.).
 4. **Does this fit in Firestore?** Prefer modeling new data in Firestore over introducing a second datastore.
 
@@ -70,8 +70,8 @@ planyour.day/
 │   │   ├── src/
 │   │   │   ├── components/    #   - shared UI (Shadcn-based) + feature components
 │   │   │   ├── views/          #   - MapView, ScheduleView (see Section 4)
-│   │   │   ├── hooks/          #   - e.g. useSwipeWeights, useDateScrubber
-│   │   │   ├── lib/            #   - api client, ranking engine, .ics export helper
+│   │   │   ├── hooks/          #   - e.g. useSwipeDeck, useDateScrubber
+│   │   │   ├── lib/            #   - api client, .ics export helper
 │   │   │   ├── types/          #   - TypeScript interfaces (see Section 5)
 │   │   │   └── main.tsx
 │   │   ├── public/
@@ -177,30 +177,24 @@ services/backend/
 
 ---
 
-## 4. Client-Side State & Swipe Weighting Strategy
+## 4. Client-Side State & Swipe List Strategy
 
-The Schedule View's core promise is **zero API spam**: swiping through the card deck must never fire a network request per swipe. All re-ranking happens client-side against the day's already-fetched candidate pool.
+The Schedule View's core promise is **zero API spam**: swiping through the card deck must never fire a network request per swipe. Sorting is deliberately simple — two lists, no weighting or re-ranking.
 
 ### 4.1 Data flow
 
 1. On date selection, the frontend makes **one** request (`GET /api/v1/plan?date=...&lat=...&lng=...`) that returns the full candidate pool of events + POIs for that day within range.
-2. The pool is held in client state (React context or a small store, e.g. Zustand — evaluate at implementation time, but keep it dependency-light) alongside a **local weights object** keyed by category/tag (e.g. `{ music: 0, football: 0, foodAndBaking: 0, ... }` seeded from onboarding interests).
-3. Each swipe (`useSwipeWeights` hook, backed by `react-swipeable`) does two things purely client-side:
-   - **Right (save):** add the card to the user's saved-for-the-day list; bump the weight of every category/tag on that card upward.
-   - **Left (skip):** discard the card; bump the weight of every category/tag on that card downward.
-4. After each swipe, the **remaining** unseen cards in the pool are re-sorted by a locally-computed score (weighted sum over each card's tags, optionally decayed by recency of the swipe that produced the weight change). No card is re-fetched or re-validated against the backend for this.
-5. Saved selections are only synced to the backend in a batched call (e.g., on view exit, on explicit "sync" action, or debounced) — never per-swipe.
+2. The pool is held in client state (React context or a small store, e.g. Zustand — evaluate at implementation time, but keep it dependency-light) and shown to the user one card at a time, in the order the backend returned it.
+3. Each swipe (`useSwipeDeck` hook, backed by `react-swipeable`) does one thing, purely client-side:
+   - **Right (save):** add the card to the **current list** — the list the user is actively building for the selected date. Create it on the first save if it doesn't exist yet.
+   - **Left (skip):** add the card to a single **generic catch-all list** shared across all skipped cards, then advance to the next card.
+4. Saved selections (both lists) are only synced to the backend in a batched call (e.g., on view exit, on explicit "sync" action, or debounced) — never per-swipe.
 
 ### 4.2 Why this shape
 
 - Keeps Cloud Run request volume proportional to *sessions*, not *swipes* — directly protects the scale-to-zero cost model in Section 1.
 - Keeps the feed feeling instant (no network round-trip in the interaction loop), which matters for a swipe-gesture UI.
-- The ranking function itself should live in `services/frontend/src/lib/ranking.ts` as a pure function `(pool, weights) => rankedPool` so it's unit-testable without any DOM/gesture dependency.
-
-### 4.3 Persistence of weights
-
-- Weights persist in `localStorage` (or `IndexedDB` if the pool grows large) keyed by user, so returning to the app mid-day keeps the personalization without a backend round-trip.
-- Weights are **not** the same thing as `UserPreferences` (see Section 5) — `UserPreferences` are explicit onboarding choices synced to Firestore; swipe weights are an ephemeral, local, fast-moving signal layered on top. Only consider promoting aggregated swipe signal to the backend as a deliberate, explicit future feature (e.g., a periodic batched "preference learning" sync) — not by default.
+- No weighting or ranking logic to build, test, or reason about — the deck order is exactly what the backend returned; a swipe only decides which of the two lists a card lands in.
 
 ---
 
@@ -230,7 +224,7 @@ export interface Location {
 
 ### 5.2 Category (shared enum)
 
-The top 20 categories a user is likely to search or filter across. There is deliberately no generic "other sports" catch-all — specific sports are broken out into their own categories instead, so weighting (Section 4) and search filters stay meaningful.
+The top 20 categories a user is likely to search or filter across. There is deliberately no generic "other sports" catch-all — specific sports are broken out into their own categories instead, so search filters stay meaningful.
 
 ```go
 type Category string
@@ -387,26 +381,21 @@ export interface UserPreferences {
 }
 ```
 
-### 5.6 SwipeAction (client-side only — not persisted to Firestore by default, see Section 4.3)
+### 5.6 SwipeAction (client-side only — not persisted to Firestore by default, see Section 4.1)
 
 ```ts
 // types/swipe.ts — no Go struct: this never crosses the network in the default flow
-export type SwipeDirection = "left" | "right"; // left = skip, right = save
+export type SwipeDirection = "left" | "right"; // left = skip → catch-all list, right = save → current list
 
 export interface SwipeAction {
   itemId: string;
   itemType: "event" | "poi";
   direction: SwipeDirection;
-  categories: Category[]; // tags carried by the swiped item, used to update weights
   timestamp: string; // ISO 8601, local
-}
-
-export interface SwipeWeights {
-  [category: string]: number; // running score per Category, seeded from UserPreferences.interests
 }
 ```
 
-If/when batched sync of swipe history is implemented (see Section 4.3), define a corresponding minimal Go struct in `entities/` at that time — don't pre-build it now.
+If/when batched sync of swipe history is implemented (see Section 4.1), define a corresponding minimal Go struct in `entities/` at that time — don't pre-build it now.
 
 ---
 
@@ -437,7 +426,7 @@ Each step below is scoped to be a reasonable unit of work for a single future Cl
    - Onboarding flow: location input(s) + interest category picker (Section 2 of business rules).
    - API client (`lib/api.ts`) and TypeScript types from Section 5.
    - `MapView`: React-Leaflet + OSM tiles, 1-day time scrubber, pins for events/POIs with transient/evergreen badges.
-   - `ScheduleView`: swipeable card deck, `useSwipeWeights` hook, `lib/ranking.ts` pure ranking function (Section 4), transient/evergreen badges.
+   - `ScheduleView`: swipeable card deck, `useSwipeDeck` hook (right → current list, left → catch-all list, per Section 4), transient/evergreen badges.
 
 5. **Tiering & monetization**
    - `usecase/planner` tier enforcement: free tier hard-limited to 1-day queries.
